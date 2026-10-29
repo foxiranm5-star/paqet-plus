@@ -33,6 +33,62 @@ yes_no() { # prompt default(y|n)
   [[ $REPLY == [yY]* ]]
 }
 
+# Network discovery for the wizard. Family flag is -4 or -6.
+# route_field FAMILY via|dev [DEV]: a field of the default route (optionally only the one on DEV).
+route_field() {
+  ip "$1" route show default ${3:+dev "$3"} 2>/dev/null |
+    awk -v k="$2" '{ for (i = 1; i < NF; i++) if ($i == k) { print $(i + 1); exit } }'
+}
+# local_ip FAMILY DEV: the first usable global address (IPv6: not temporary, deprecated or fc00::/7).
+local_ip() {
+  if [ "$1" = -6 ]; then
+    ip -6 -o addr show dev "$2" scope global 2>/dev/null |
+      awk '$0 !~ /temporary|deprecated|tentative/ && $4 !~ /^f[cd]/ { split($4, a, "/"); print a[1]; exit }'
+  else
+    ip -4 -o addr show dev "$2" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }'
+  fi
+}
+# neigh_mac FAMILY GW DEV: the MAC of the next hop, from the ARP (IPv4) or NDP (IPv6) table.
+neigh_mac() {
+  ip "$1" neigh show "$2" dev "$3" 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }'
+}
+# gw_mac FAMILY GW DEV: neigh_mac, after one ping to fill the table when it is empty.
+gw_mac() {
+  local mac
+  mac=$(neigh_mac "$1" "$2" "$3")
+  if [ -z "$mac" ]; then
+    if [ "$1" = -6 ]; then
+      ping -6 -c 1 -W 1 -I "$3" "$2" >/dev/null 2>&1 || ping6 -c 1 -I "$3" "$2" >/dev/null 2>&1 || true
+    else
+      ping -4 -c 1 -W 1 "$2" >/dev/null 2>&1 || true
+    fi
+    mac=$(neigh_mac "$1" "$2" "$3")
+  fi
+  printf '%s' "$mac"
+}
+strip_brackets() { local v=${1#\[}; printf '%s' "${v%\]}"; }
+# fw_rules IPTABLES PORT: the NOTRACK and RST rules; IPTABLES is iptables or ip6tables.
+fw_rules() {
+  local ipt=$1 port=$2
+  if ! command -v "$ipt" >/dev/null 2>&1; then
+    bad "$ipt not found: add the NOTRACK and RST-drop rules for TCP $port by hand."
+    return 1
+  fi
+  if ! "$ipt" -t raw -C PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null; then
+    "$ipt" -t raw -A PREROUTING -p tcp --dport "$port" -j NOTRACK
+    good "$ipt raw PREROUTING NOTRACK"
+  fi
+  if ! "$ipt" -t raw -C OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null; then
+    "$ipt" -t raw -A OUTPUT -p tcp --sport "$port" -j NOTRACK
+    good "$ipt raw OUTPUT NOTRACK"
+  fi
+  if ! "$ipt" -t mangle -C OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; then
+    "$ipt" -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+    good "$ipt mangle OUTPUT DROP RST"
+  fi
+}
+
 [ "$(id -u)" -eq 0 ] || { bad "Run as root: sudo bash setup-paqet-plus.sh"; exit 1; }
 
 # paqet2 -> paqet: retired modes, pcap move, removed keys, and the standard tuning of a fresh install.
@@ -245,44 +301,103 @@ else
     *) ROLE=server ;;
   esac
 
-  # Raw packets need the interface, its IP, and the gateway MAC (the next hop they are sent to).
-  AUTO_IFACE=$(ip route | awk '/^default/ { print $5; exit }')
-  AUTO_GW='' AUTO_IP='' AUTO_MAC=''
+  # The IP family. A client follows its server's address (raw packets must leave from a local address
+  # of the same family); a server can listen on IPv4, IPv6 or both.
+  USE_V4=0 USE_V6=0
+  if [ "$ROLE" = client ]; then
+    ask "Remote server IP (IPv4 or IPv6): "
+    SERVER_IP=$(strip_brackets "$REPLY")
+    ask "Remote server port (Enter = 9999): " 9999
+    SERVER_PORT=$REPLY
+    case $SERVER_IP in
+      *:*) USE_V6=1 ;;
+      *) USE_V4=1 ;;
+    esac
+  else
+    PROBE4=$(route_field -4 dev)
+    PROBE6=$(route_field -6 dev)
+    DEF_FAM=1
+    if [ -z "$PROBE4" ] && [ -n "$PROBE6" ]; then DEF_FAM=2; elif [ -n "$PROBE4" ] && [ -n "$PROBE6" ]; then DEF_FAM=3; fi
+    say ""
+    say "${Y}IP version${N}: what the server listens on"
+    say "   1) IPv4        2) IPv6        3) both (dual stack)"
+    ask "IP version [1/2/3] (Enter = $DEF_FAM): " "$DEF_FAM"
+    case $REPLY in
+      2) USE_V6=1 ;;
+      3) USE_V4=1 USE_V6=1 ;;
+      *) USE_V4=1 ;;
+    esac
+  fi
+
+  # Raw packets need the interface, its IP, and the gateway MAC (the next hop they are sent to), per family.
+  if [ "$USE_V4" = 1 ]; then AUTO_IFACE=$(route_field -4 dev); else AUTO_IFACE=''; fi
+  [ -n "$AUTO_IFACE" ] || AUTO_IFACE=$(route_field -6 dev)
+  V4_IP='' V4_MAC='' V6_IP='' V6_MAC=''
   if [ -z "$AUTO_IFACE" ]; then
     bad "No default route found: enter the network details by hand."
   else
-    AUTO_GW=$(ip route | awk '/^default/ { print $3; exit }')
-    AUTO_IP=$(ip -4 -o addr show "$AUTO_IFACE" | awk '{ split($4, a, "/"); print a[1]; exit }')
-    AUTO_MAC=$(ip neigh show "$AUTO_GW" 2>/dev/null | awk -v d="$AUTO_IFACE" 'index($0, d) { print $5; exit }')
-    if [ -z "$AUTO_MAC" ]; then
-      ping -c 1 -W 1 "$AUTO_GW" >/dev/null 2>&1 || true   # populates the ARP table
-      AUTO_MAC=$(ip neigh show "$AUTO_GW" 2>/dev/null | awk -v d="$AUTO_IFACE" 'index($0, d) { print $5; exit }')
-    fi
     say ""
     say "${Y}Network${N}: found on this server"
     say "  Interface:   $AUTO_IFACE"
-    say "  Local IP:    $AUTO_IP"
-    say "  Gateway MAC: $AUTO_MAC"
+    if [ "$USE_V4" = 1 ]; then
+      V4_GW=$(route_field -4 via "$AUTO_IFACE")
+      V4_IP=$(local_ip -4 "$AUTO_IFACE")
+      [ -z "$V4_GW" ] || V4_MAC=$(gw_mac -4 "$V4_GW" "$AUTO_IFACE")
+      say "  IPv4:        $V4_IP  (gateway MAC: $V4_MAC)"
+    fi
+    if [ "$USE_V6" = 1 ]; then
+      V6_GW=$(route_field -6 via "$AUTO_IFACE")
+      V6_IP=$(local_ip -6 "$AUTO_IFACE")
+      [ -z "$V6_GW" ] || V6_MAC=$(gw_mac -6 "$V6_GW" "$AUTO_IFACE")
+      say "  IPv6:        $V6_IP  (gateway MAC: $V6_MAC)"
+    fi
   fi
   if [ -z "$AUTO_IFACE" ] || ! yes_no "Use these settings? [Y/n] " y; then
     ask "Interface: " "$AUTO_IFACE"
     CFG_IFACE=$REPLY
-    ask "Local IP (without port): " "$AUTO_IP"
-    CFG_IP=$REPLY
-    ask "Gateway MAC: " "$AUTO_MAC"
-    CFG_MAC=$REPLY
+    if [ "$USE_V4" = 1 ]; then
+      ask "Local IPv4 (without port): " "$V4_IP"
+      V4_IP=$REPLY
+      ask "IPv4 gateway MAC: " "$V4_MAC"
+      V4_MAC=$REPLY
+    fi
+    if [ "$USE_V6" = 1 ]; then
+      ask "Local IPv6 (without port or brackets): " "$V6_IP"
+      V6_IP=$(strip_brackets "$REPLY")
+      ask "IPv6 gateway MAC: " "$V6_MAC"
+      V6_MAC=$REPLY
+    fi
   else
     CFG_IFACE=$AUTO_IFACE
-    CFG_IP=$AUTO_IP
-    CFG_MAC=$AUTO_MAC
   fi
-  # Empty values would write a dead config: keep asking until all three are set.
-  while [ -z "$CFG_IFACE" ] || [ -z "$CFG_IP" ] || [ -z "$CFG_MAC" ]; do
+  # Empty values would write a dead config: keep asking until everything needed is set.
+  net_incomplete() {
+    [ -z "$CFG_IFACE" ] && return 0
+    [ "$USE_V4" = 1 ] && { [ -z "$V4_IP" ] || [ -z "$V4_MAC" ]; } && return 0
+    [ "$USE_V6" = 1 ] && { [ -z "$V6_IP" ] || [ -z "$V6_MAC" ]; } && return 0
+    return 1
+  }
+  while net_incomplete; do
     bad "Network details incomplete; fill the missing field(s)."
     [ -n "$CFG_IFACE" ] || { ask "Interface: "; CFG_IFACE=$REPLY; }
-    [ -n "$CFG_IP" ] || { ask "Local IP (without port): "; CFG_IP=$REPLY; }
-    [ -n "$CFG_MAC" ] || { ask "Gateway MAC: "; CFG_MAC=$REPLY; }
+    if [ "$USE_V4" = 1 ]; then
+      [ -n "$V4_IP" ] || { ask "Local IPv4 (without port): "; V4_IP=$REPLY; }
+      [ -n "$V4_MAC" ] || { ask "IPv4 gateway MAC: "; V4_MAC=$REPLY; }
+    fi
+    if [ "$USE_V6" = 1 ]; then
+      [ -n "$V6_IP" ] || { ask "Local IPv6 (without port or brackets): "; V6_IP=$(strip_brackets "$REPLY"); }
+      [ -n "$V6_MAC" ] || { ask "IPv6 gateway MAC: "; V6_MAC=$REPLY; }
+    fi
   done
+  # The network: section of the config, for the port given ($1).
+  net_yaml() {
+    if [ "$USE_V4" = 1 ]; then
+      printf '  ipv4:\n    addr: "%s:%s"\n    router_mac: "%s"\n' "$V4_IP" "$1" "$V4_MAC"
+    fi
+    if [ "$USE_V6" = 1 ]; then
+      printf '  ipv6:\n    addr: "[%s]:%s"\n    router_mac: "%s"\n' "$V6_IP" "$1" "$V6_MAC"
+    fi
+  }
 
   say ""
   say "${Y}Secret key${N}: both servers must use the same one."
@@ -345,9 +460,7 @@ log:
   level: "info"
 network:
   interface: "$CFG_IFACE"
-  ipv4:
-    addr: "$CFG_IP:$PORT"
-    router_mac: "$CFG_MAC"
+$(net_yaml "$PORT")
   pcap:
     sockbuf: 16777216
 transport:
@@ -385,18 +498,8 @@ EOF
     # The kernel must not track or reset packets on the paqet-plus port: without these rules it fights the
     # raw path with RSTs and conntrack.
     say "${Y}Firewall${N}: NOTRACK and RST suppression on TCP $PORT."
-    if ! iptables -t raw -C PREROUTING -p tcp --dport "$PORT" -j NOTRACK 2>/dev/null; then
-      iptables -t raw -A PREROUTING -p tcp --dport "$PORT" -j NOTRACK
-      good "raw PREROUTING NOTRACK"
-    fi
-    if ! iptables -t raw -C OUTPUT -p tcp --sport "$PORT" -j NOTRACK 2>/dev/null; then
-      iptables -t raw -A OUTPUT -p tcp --sport "$PORT" -j NOTRACK
-      good "raw OUTPUT NOTRACK"
-    fi
-    if ! iptables -t mangle -C OUTPUT -p tcp --sport "$PORT" --tcp-flags RST RST -j DROP 2>/dev/null; then
-      iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags RST RST -j DROP
-      good "mangle OUTPUT DROP RST"
-    fi
+    [ "$USE_V4" = 1 ] && fw_rules iptables "$PORT"
+    [ "$USE_V6" = 1 ] && fw_rules ip6tables "$PORT"
     # Preseed debconf: iptables-persistent otherwise prompts interactively and hangs `curl | sudo bash`.
     echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
     echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
@@ -407,11 +510,6 @@ EOF
       bad "Could not install iptables-persistent; save the rules by hand."
     fi
   else
-    ask "Remote server IP: "
-    SERVER_IP=$REPLY
-    ask "Remote server port (Enter = 9999): " 9999
-    SERVER_PORT=$REPLY
-
     say ""
     say "${Y}Client mode${N}"
     say "   1) SOCKS5 proxy"
@@ -419,6 +517,7 @@ EOF
     ask "> " 1
     CLIENT_MODE=$REPLY
 
+    if [ "$USE_V6" = 1 ]; then SERVER_ADDR="[$SERVER_IP]:$SERVER_PORT"; else SERVER_ADDR="$SERVER_IP:$SERVER_PORT"; fi
     say "${Y}Config${N}: writing $CONFIG_FILE"
     cat > "$CONFIG_FILE" <<EOF
 role: "client"
@@ -426,13 +525,11 @@ log:
   level: "info"
 network:
   interface: "$CFG_IFACE"
-  ipv4:
-    addr: "$CFG_IP:0"
-    router_mac: "$CFG_MAC"
+$(net_yaml 0)
   pcap:
     sockbuf: 16777216
 server:
-  addr: "$SERVER_IP:$SERVER_PORT"
+  addr: "$SERVER_ADDR"
 transport:
   protocol: "kcp"
   conn: 8

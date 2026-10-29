@@ -122,6 +122,35 @@ transport:
     key: "your-secret-key"
 ```
 
+### IPv6
+
+paqet-plus speaks IPv6 as well as IPv4, on the raw path and in the config. Add an `ipv6` block next to (or instead of) `ipv4`; at least one is required, and when both are set they must use the same port.
+
+```
+network:
+  interface: "eth0"
+  ipv4:
+    addr: "10.0.0.100:9999"
+    router_mac: "aa:bb:cc:dd:ee:ff"
+  ipv6:
+    addr: "[2001:db8::100]:9999"   # global address, in brackets
+    router_mac: "aa:bb:cc:dd:ee:01" # MAC of the IPv6 gateway
+```
+
+- **Server:** listens on every family you configure (dual stack works).
+- **Client:** the family of `server.addr` decides which local block is used, so a client that dials `[2001:db8::100]:9999` needs an `ipv6` block, and one that dials `203.0.113.7:9999` needs `ipv4`. Port `0` still means a random port.
+- **Gateway MAC:** IPv6 uses NDP, not ARP. Find it with `ip -6 route show default` (the gateway is usually a `fe80::` address), then `ping -6 -c1 -I eth0 <gateway>` and `ip -6 neigh show <gateway> dev eth0`.
+- **Firewall:** on a server, repeat the three rules with `ip6tables` (the installer does this for you):
+
+```
+sudo ip6tables -t raw    -A PREROUTING -p tcp --dport 9999 -j NOTRACK
+sudo ip6tables -t raw    -A OUTPUT     -p tcp --sport 9999 -j NOTRACK
+sudo ip6tables -t mangle -A OUTPUT     -p tcp --sport 9999 --tcp-flags RST RST -j DROP
+```
+
+- Use a global (not temporary, not `fd00::/8`) address, and keep both ends on the same interface.
+- Forwards and SOCKS5 can listen on or target IPv6 too: `listen: "[::1]:1080"`.
+
 ### Defaults
 
 A key left out of the config gets the value that measured best on a shared 78 ms path, the same the installer writes:
